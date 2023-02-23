@@ -20,7 +20,7 @@ Http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("appli
     // also has a debug statement that will send calls to the Timesheet API)
     //
     // You'll need to adjust the following credentials as this is from a demo database I used to have.
-    string AccessToken = "access_token=\"client=0b216a3614354c5c8b84b98ea779fe36.352977&user_token=64fc431e5fbd46b8916477dd71841216.352977\"";
+    string AccessToken = "access_token=\"client=ConsumerSecretHere&user_token=UserDataAccessTokenHere\"";
     Http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("WRAP", AccessToken);
 #endif
 
