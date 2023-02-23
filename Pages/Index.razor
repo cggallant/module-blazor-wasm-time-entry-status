@@ -1,0 +1,538 @@
+﻿@page "/"
+@page "/index"
+@page "/index.html"
+
+@using BlazorTimeEntryStatusModule.Models;
+@using Blazor.Extensions;
+@using Blazor.Extensions.Canvas;
+@using Blazor.Extensions.Canvas.Canvas2D;
+@using Blazor.Extensions.Canvas.Model;
+
+@inject HttpClient Http;
+@inject IJSRuntime JSRuntime;
+
+<h2>Time Entry Status</h2>
+
+<div class="form-group">
+    <BECanvas Width="600" Height="135" @ref="_canvasReference"></BECanvas>
+</div>
+
+<div class="form-group">
+    <label for="employeeList">Employees:</label>
+    <select id="employeeList" class="form-control" size="6" @onchange="OnChangeEmployeeList">
+        @if (EmployeeResponse != null)
+        {
+            @foreach (Employee employee in EmployeeResponse.Employees)
+            {
+                <option class="p-2" value="@employee.ID">@employee.LastName, @employee.FirstName</option>
+            }
+        }
+    </select>
+
+    <div class="p-2 d-flex justify-content-center">
+        @if (IsThereAPreviousPage())
+        {
+            <input type="button" class="btn btn-primary m-2" value="< Previous Employees" @onclick="OnClickPreviousPageOfEmployees" />
+        }
+
+        @if (IsThereANextPage())
+        {
+            <input type="button" class="btn btn-primary m-2" value="Next Employees >" @onclick="OnClickNextPageOfEmployees" />
+        }
+    </div>
+</div>
+
+
+@code {
+    private string _RootUri = "";
+    private const string API_VERSION = "7";
+    private const string XML_DATE_FORMAT = "yyyy-MM-dd";
+    private const string URI_NOT_AVAILABLE = "N/A";
+
+    private const int TIMELINE_HEIGHT = 95; // The blue part of the timeline where the triangles will be drawn
+    private const int TIMELINE_BORDER_WIDTH = 2;
+    private const int DAY_QUARTER_HEIGHT = 18; // 4 possible rows with a bit of vertical padding between each
+    private const int DATE_RANGE_DAYS = 30;
+
+    const string TIMELINE_BACKGROUND_COLOR = "rgb(141, 165, 237)";
+    const string TIMELINE_BORDER_COLOR = "rgb(112, 146, 190)";
+    const string NON_WORKING_DAY_BACKGROUND_COLOR = "rgba(112, 146, 190, 0.3)"; // With an alpha channel
+    const string TODAY_BACKGROUND_COLOR = "rgb(188, 199, 229)";
+    const string TEXT_COLOR = "black";
+    const string PROCESSING_TEXT_BACKGROUND_COLOR = "rgba(0, 0, 0, 0.5)"; // With an alpha channel
+    const string PROCESSING_TEXT_COLOR = "white";
+
+    const string STATUS_COLOR_REJECTED_FILL = "rgb(245, 135, 133)";
+    const string STATUS_COLOR_REJECTED_BORDER = "rgb(242, 95, 92)";
+    const string STATUS_COLOR_UNSUBMITTED_FILL = "rgb(64, 64, 64)";
+    const string STATUS_COLOR_UNSUBMITTED_BORDER = "rgb(0, 0, 0)";
+    const string STATUS_COLOR_UNDER_REVIEW_FILL = "rgb(255, 210, 127)";
+    const string STATUS_COLOR_UNDER_REVIEW_BORDER = "rgb(255, 195, 84)";
+    const string STATUS_COLOR_APPROVED_FILL = "rgb(128, 209, 170)";
+    const string STATUS_COLOR_APPROVED_BORDER = "rgb(85, 193, 141)";
+
+    protected const string FONTINFO_ARIAL_9 = "9px arial";
+    protected const string FONTINFO_ARIAL_11 = "11px arial";
+    protected const string FONTINFO_ARIAL_26_BOLD = "bold 26px arial";
+
+    // Dates with the time portion zeroed out
+    private DateTime _StartDate = DateTime.Now.Date.AddDays(-DATE_RANGE_DAYS);
+    private DateTime _EndDate = DateTime.Now.Date;
+
+    // Calculated in the OnAfterRenderAsync function
+    private double _TextHeightArial9 = 0.0;
+    private double _TextHeightArial11 = 0.0;
+    private double _TextHeightArial26Bold = 0.0;
+
+    // Canvas drawing references
+    private Canvas2DContext _context = null;
+    protected BECanvasComponent _canvasReference;
+
+    // Will hold the data received from the API
+    private EmployeeResponse EmployeeResponse = null;
+    private List<TimeEntry> _TimeEntries = new List<TimeEntry>();
+
+    protected bool _IndicateProcessing = false; // Only show the processing indicator when an employee is selected
+
+    protected override async Task OnInitializedAsync()
+    {
+        // Get the root uri to use when asking Timesheet to talk to the API
+#if DEBUG
+        _RootUri = "https://api.dovico.com/";
+#else // Production build...
+        _RootUri = await JSRuntime.InvokeAsync<string>("GetTimesheetRootURI");
+#endif
+
+        // If the call for employees failed...
+        HttpResponseMessage response = await LoadEmployees(_RootUri + "Employees/?version=" + API_VERSION);
+        if (!response.IsSuccessStatusCode)
+        {
+            // If the call failed because the user is not authorized then try requesting the /Employees/Me/ information instead. The logged in user might
+            // not have permission to call the /Employees/ uri.
+            if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+            {
+                await LoadEmployees(_RootUri + "Employees/Me/?version=" + API_VERSION);
+            }
+        }
+    }
+
+    protected async Task<HttpResponseMessage> LoadEmployees(string uri)
+    {
+        // Clear the list of employees
+        EmployeeResponse = null;
+
+        // Flag that we're processing and draw the timeline
+        _IndicateProcessing = true;
+        DrawTimeline(null); // Don't wait for the draw to finish. Load in the list of employees while the timeline refreshes and shows the processing indicator.
+
+
+        // Load the requested page of employees. If the call was successful then parse the JSON. The call might not be successful if the logged in user
+        // doesn't have permission to call the /Employees/ uri of the API. If that happens, the calling function will switch to the /Employees/Me/ uri.
+        HttpResponseMessage response = await Http.GetAsync(uri);
+        if (response.IsSuccessStatusCode)
+        {
+            EmployeeResponse = await response.Content.ReadFromJsonAsync<EmployeeResponse>();
+        }
+
+
+        // Now that we have the list of employees, turn off the processing flag
+        _IndicateProcessing = false;
+        DrawTimeline(null); // Don't wait for the draw to finish.
+
+        // Return the HTTP response object so that the caller knows if this function's API call was successful.
+        return response;
+    }
+
+    // An Employees/Me/ call doesn't return PrevPageURI or NextPageURI properties so test to make sure the property exists rather than just test for 'N/A'.
+    protected bool IsThereAPreviousPage()
+    {
+        return (EmployeeResponse != null && EmployeeResponse.PrevPageURI != null && EmployeeResponse.PrevPageURI != "N/A");
+    }
+    protected bool IsThereANextPage()
+    {
+        return (EmployeeResponse != null && EmployeeResponse.NextPageURI != null && EmployeeResponse.NextPageURI != "N/A");
+    }
+
+    // User clicked the Previous Page button
+    protected async Task OnClickPreviousPageOfEmployees(MouseEventArgs args)
+    {
+        if (IsThereAPreviousPage()) { await LoadEmployees(EmployeeResponse.PrevPageURI); }
+    }
+
+    // User clicked the Next Page button
+    protected async Task OnClickNextPageOfEmployees(MouseEventArgs args)
+    {
+        if (IsThereANextPage()) { await LoadEmployees(EmployeeResponse.NextPageURI); }
+    }
+
+    // The user selected an employee in the list
+    protected async Task OnChangeEmployeeList(ChangeEventArgs e)
+    {
+        // Flag that we're processing and draw the timeline
+        _IndicateProcessing = true;
+        DrawTimeline(null); // Don't wait for the draw to finish. Load in the time entries for the selected employee while the timeline refreshes and shows the processing indicator.
+
+
+        // Get the selected employee id
+        string EmployeeID = e.Value.ToString();
+
+        // Clear the list of time entries just in case we have some from another employee. Load in the selected employee's time that's within our date range.
+        _TimeEntries.Clear();
+        await LoadTimeEntries(_RootUri + "TimeEntries/Employee/" + EmployeeID + "/?version=" + API_VERSION + "&daterange=" + _StartDate.ToString(XML_DATE_FORMAT) + "%20" + _EndDate.ToString(XML_DATE_FORMAT));
+
+        // Sort the time entries by date (they were returned grouped by TempTrans and then Trans).
+        _TimeEntries.Sort((a, b) => a.TheDate.CompareTo(b.TheDate));
+
+
+        // Now that we have the selected employee's time entries, turn off the processing flag
+        _IndicateProcessing = false;
+
+        // Find the employee object belonging to the selected employee id. Redraw the timeline with this employee's time.
+        Employee Employee = EmployeeResponse.Employees.Find(item => item.ID == EmployeeID);
+        await DrawTimeline(Employee);
+    }
+
+    // Recursive function to load in all the time entries for the selected employee
+    protected async Task LoadTimeEntries(string uri)
+    {
+        // Grab the requested time entries and add them to the list.
+        TimeEntryResponse response = await Http.GetFromJsonAsync<TimeEntryResponse>(uri);
+        if (response.TimeEntries.Count > 0) { _TimeEntries.AddRange(response.TimeEntries); }
+
+        // If there's a next page of time entries, call this function again passing in the next page uri
+        if (response.NextPageURI != URI_NOT_AVAILABLE) { await LoadTimeEntries(response.NextPageURI); }
+    }
+
+
+    // The Canvas object is not available during OnInitializedAsync. Can only obtain it at this point.
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        // This function gets run multiple times but we only need the following code run if we don't yet
+        // have the canvas context
+        if (_context == null)
+        {
+            // Get the 2D context from the canvas
+            _context = await _canvasReference.CreateCanvas2DAsync();
+
+            // Rather than calculating these every time the DrawTimeline function is called, cache the values
+            _TextHeightArial9 = await GetTextHeightAsync(FONTINFO_ARIAL_9);
+            _TextHeightArial11 = await GetTextHeightAsync(FONTINFO_ARIAL_11);
+            _TextHeightArial26Bold = await GetTextHeightAsync(FONTINFO_ARIAL_26_BOLD);
+
+            // There's no employee selected at this point. Just draw the timeline itself.
+            await DrawTimeline(null);
+        }
+    }
+
+    protected async Task DrawTimeline(Employee Employee)
+    {
+        // Just in case this function gets called before the Canvas is ready
+        if (_context == null) { return; }
+
+        // Returned as long but it impacts the DayCellWidth calculation if left as a long
+        double CanvasHeight = _canvasReference.Height;
+        double CanvasWidth = _canvasReference.Width;
+
+        // Give a bit of space before the top of the timeline for the month abbreviation(s). The month abbreviation is going to be
+        // drawn 5 pixels above the timeline so add the extra space.
+        double TimelineTop = (_TextHeightArial11 + 5);
+
+        // Day (cell) calculations (Date Range is 30 days 'before' today's date which is 31 days in total so add 1 to the days)
+        double DayCellWidth = ((CanvasWidth - (TIMELINE_BORDER_WIDTH)) / (DATE_RANGE_DAYS + 1)); // The width permitted for each day's cell
+        double HalfDayCellWidth = (DayCellWidth / 2);
+        double DayTop = (TimelineTop + DAY_QUARTER_HEIGHT); // Give room for the day of the month numbers
+
+
+        // All of the drawings will be made at once
+        //await _context.BeginBatchAsync(); <- measuring the text doesn't work right if this is used (I'm guessing the font information doesn't get applied)
+
+        // Clear the previous drawing (the opaque background for the processing indicator is the reason for this)
+        await _context.ClearRectAsync(0, 0, CanvasWidth, CanvasHeight);
+
+        // The canvas lines are blurry so we straddle the pixels (https://stackoverflow.com/questions/8696631/canvas-drawings-like-lines-are-blurry).
+        // At the end, after everything is drawn, we'll translate everything back by -0.5.
+        await _context.TranslateAsync(0.5, 0.5);
+
+        // Fill the timeline's background with the light blue
+        await _context.SetFillStyleAsync(TIMELINE_BACKGROUND_COLOR);
+        await _context.FillRectAsync(0, TimelineTop, CanvasWidth, TIMELINE_HEIGHT);
+
+        // Draw the border
+        await _context.BeginPathAsync();// Clears previous lines that were drawn
+        await _context.SetLineWidthAsync(TIMELINE_BORDER_WIDTH);
+        await _context.SetStrokeStyleAsync(TIMELINE_BORDER_COLOR);
+        await _context.StrokeRectAsync(1, TimelineTop, (CanvasWidth - TIMELINE_BORDER_WIDTH - 1), TIMELINE_HEIGHT);
+
+
+        // Set the stroke to a width of 1 for the rest of the lines (month divider and current date lines)
+        await _context.SetLineWidthAsync(1);
+
+        int CurrentDayIndex = 0;
+        double MonthRightX = 0.0;
+        double X = 0.0;
+        double Y = 0.0;
+
+        DateTime LoopDate = _StartDate;
+        while (LoopDate <= _EndDate)
+        {
+            // Draw the current month's abbreviation above the timeline if this is the first time through the loop.
+            if (CurrentDayIndex == 0) { MonthRightX = await DrawMonthAbbreviation((X + 4), (TimelineTop - 5), LoopDate); }
+
+            // If the current day is the first day of the month then...
+            if (LoopDate.Day == 1)
+            {
+                // Draw a vertical line separating the previous month from the new one
+                await _context.BeginPathAsync();// Clears previous lines that were drawn
+                await _context.SetStrokeStyleAsync(TIMELINE_BORDER_COLOR);
+                await _context.MoveToAsync(X, TimelineTop);
+                await _context.LineToAsync(X, (TimelineTop + TIMELINE_HEIGHT));
+                await _context.StrokeAsync(); // Draw the line
+
+                // If this is not the first time through the loop then...(if this is the first time through the loop, the month abbreviation was already drawn above)
+                if (CurrentDayIndex > 0)
+                {
+                    // Determine the X position of the text. If the position we want to use will overlap an existing abbreviation then adjust the X position to
+                    // accommodate the previous abbreviation.
+                    double MonthX = (X + 4);
+                    if ((X + 4) <= MonthRightX) { MonthX = (MonthRightX + 4); }
+
+                    // Draw the current month's abbreviation
+                    MonthRightX = await DrawMonthAbbreviation(MonthX, (TimelineTop - 5), LoopDate);
+                }
+            }
+
+            // If this is the last date of the loop, we've reached the current date...
+            if (LoopDate == _EndDate)
+            {
+                // Draw an outline around today's date
+                await _context.SetStrokeStyleAsync(TIMELINE_BORDER_COLOR);
+                await _context.SetFillStyleAsync(TODAY_BACKGROUND_COLOR);
+                await _context.FillRectAsync(X, TimelineTop, DayCellWidth, TIMELINE_HEIGHT);
+                await _context.StrokeRectAsync(X, TimelineTop, DayCellWidth, TIMELINE_HEIGHT);
+
+            }
+            else // Haven't yet reached today's date...
+            {
+                // If this is a non-working day, draw the background for a non-working day (Saturday and Sunday if there is no
+                // employee selected or if the logged in employee doesn't have employee permissions. Otherwise, it's any day
+                // the employee is not scheduled to work based on the WorkDays value <- Employee Properties in Timesheet.)
+                await DrawNonWorkingDayBackgroundAsync(X, TimelineTop, DayCellWidth, TIMELINE_HEIGHT, LoopDate, Employee);
+            }
+
+            // Draw the day of the month (e.g. 1, 2, ...30, 31) just below the top border (will be horizontally centered in the cell)
+            Y = (TimelineTop + TIMELINE_BORDER_WIDTH + _TextHeightArial9 + 2);
+            await DrawDayOfMonthAsync((X + HalfDayCellWidth), Y, LoopDate);
+
+            // If an employee was selected...
+            if (Employee != null)
+            {
+                // Draw the Status indicators (indicates if there are Rejected, Non-Submitted, Under Review, or Approved time entries for the current date)
+                await DrawQuarterCellStatusesAsync(X, DayTop, DayCellWidth, LoopDate);
+            }
+
+            // Increment the current index and date for the next looop
+            LoopDate = LoopDate.AddDays(1);
+            CurrentDayIndex++;
+
+            // Determine the X position for the current day's data (we increment at the end of the loop rather than the beginning so that, after the loop, the
+            // value can be used to indicate the current date on the timeline at the proper position. Saves the code after the loop from having to increment this
+            // value.)
+            X = (CurrentDayIndex * DayCellWidth);
+        }
+
+        // Draw the legend under the timeline (+ 2 so there's a bit of padding between the bottom of the timeline and top of
+        // the triangles)
+        Y = (TimelineTop + TIMELINE_HEIGHT + 2);
+        await DrawLegend(4, Y);
+
+        // Draw Today's date (e.g. 'Today (July 15, 2020)') below the timeline
+        await DrawTodayStringAsync((X - TIMELINE_BORDER_WIDTH), (Y + _TextHeightArial11), _EndDate);
+
+        // Draw the 'Processing...' text if we've been asked for it (done at the end so that the timeline is drawn below the processing indicator)
+        await DrawProcessingAsync(CanvasWidth, CanvasHeight);
+
+        // The canvas lines were blurry so we straddled the pixels (https://stackoverflow.com/questions/8696631/canvas-drawings-like-lines-are-blurry).
+        // Now we'll translate everything back by -0.5.
+        await _context.TranslateAsync(-0.5, -0.5);
+
+        // Have everything drawn now
+        //await _context.EndBatchAsync(); <-- measuring text doesn't work when this is used (could potentially measure it when the context is first
+        // obtained but if that's the case GetTextHeightAsync also doesn't work right.).
+    }
+
+    // FontInfo is the size/font. For example: "9px arial"
+    protected async Task<double> GetTextHeightAsync(string FontInfo)
+    {
+        // NOTE: This is a hack because, at this time, MeasureTextAsync only returns a TextMetrics value holding the width. All other
+        // values are zero! Measuring the width of 'M' is pretty close to getting the height of the text from what I've read.
+        await _context.SetFontAsync(FontInfo);
+        TextMetrics Metrics = await _context.MeasureTextAsync("M");
+        return Metrics.Width;
+    }
+
+    // NOTE: The Employee parameter object will be null if there isn't an employee selected in the list
+    protected async Task DrawNonWorkingDayBackgroundAsync(double X, double Y, double Width, double Height, DateTime LoopDate, Employee Employee)
+    {
+        bool IsNonWorkingDay = false;
+
+        // If there is no employee selected...
+        if (Employee == null)
+        {
+            // Saturday and Sunday are the default non-working days
+            IsNonWorkingDay = (LoopDate.DayOfWeek == DayOfWeek.Saturday || LoopDate.DayOfWeek == DayOfWeek.Sunday);
+        }
+        else // There is an employee selected...
+        {
+            // Check to see if this day is a non-working day for the selected employee
+            IsNonWorkingDay = !Employee.IsWorkingDay(LoopDate.DayOfWeek);
+        }
+
+        // If this is a non-working day...
+        if (IsNonWorkingDay)
+        {
+            await _context.SetFillStyleAsync(NON_WORKING_DAY_BACKGROUND_COLOR);
+            await _context.FillRectAsync(X, Y, Width, Height);
+        }
+    }
+
+    // Returns the right edge of the text (so that, if there's a new month to draw, we don't draw over the prevous one)
+    protected async Task<double> DrawMonthAbbreviation(double X, double Y, DateTime LoopDate)
+    {
+        string Text = LoopDate.ToString("MMM");
+        double Width = await DrawTextAsync(X, Y, Text, FONTINFO_ARIAL_11);
+
+        return (X + Width);
+    }
+    protected async Task DrawDayOfMonthAsync(double X, double Y, DateTime LoopDate)
+    {
+        // Text is horizontally centered in the day's column
+        string Text = LoopDate.Day.ToString();// The numeric day value (e.g. 1, 2, ... 30, 31)
+        await DrawTextAsync(X, Y, Text, FONTINFO_ARIAL_9, TEXT_COLOR, TextAlign.Center);
+    }
+    protected async Task DrawTodayStringAsync(double X, double Y, DateTime Today)
+    {
+        // Text is right-aligned on the X
+        string Text = Today.ToString("'Today ('MMMM d, yyyy')'");
+        await DrawTextAsync(X, Y, Text, FONTINFO_ARIAL_11, TEXT_COLOR, TextAlign.Right, TextBaseline.Middle);
+    }
+
+    protected async Task DrawQuarterCellStatusesAsync(double X, double Y, double DayCellWidth, DateTime LoopDate)
+    {
+        bool DayHasRejectedTime = false;
+        bool DayHasUnsubmittedTime = false;
+        bool DayHasUnderReviewTime = false;
+        bool DayHasApprovedTime = false;
+        string Status = "";
+
+        foreach (TimeEntry Time in _TimeEntries)
+        {
+            // If we've passed the date we're looking for, exit the loop.
+            if (Time.TheDate > LoopDate) { break; }
+
+            // If the current item matches the date we're looking for then...
+            if (Time.TheDate == LoopDate)
+            {
+                Status = Time.Sheet.Status;
+                if (Status == "R") { DayHasRejectedTime = true; }
+                else if (Status == "N") { DayHasUnsubmittedTime = true; }
+                else if (Status == "U") { DayHasUnderReviewTime = true; }
+                else if (Status == "A") { DayHasApprovedTime = true; }
+
+                // If all four statuses have been found, there's no point in looping any further
+                if (DayHasRejectedTime && DayHasUnsubmittedTime && DayHasUnderReviewTime && DayHasApprovedTime) { break; }
+            }
+        }
+
+        int Quarter = 0;
+        if (DayHasUnsubmittedTime) { await DrawTriangle(X, (Y + (Quarter * DAY_QUARTER_HEIGHT)), DayCellWidth, STATUS_COLOR_UNSUBMITTED_FILL, STATUS_COLOR_UNSUBMITTED_BORDER); }
+
+        Quarter = 1;
+        if (DayHasRejectedTime) { await DrawTriangle(X, (Y + (Quarter * DAY_QUARTER_HEIGHT)), DayCellWidth, STATUS_COLOR_REJECTED_FILL, STATUS_COLOR_REJECTED_BORDER); }
+
+        Quarter = 2;
+        if (DayHasUnderReviewTime) { await DrawTriangle(X, (Y + (Quarter * DAY_QUARTER_HEIGHT)), DayCellWidth, STATUS_COLOR_UNDER_REVIEW_FILL, STATUS_COLOR_UNDER_REVIEW_BORDER); }
+
+        Quarter = 3;
+        if (DayHasApprovedTime) { await DrawTriangle(X, (Y + (Quarter * DAY_QUARTER_HEIGHT)), DayCellWidth, STATUS_COLOR_APPROVED_FILL, STATUS_COLOR_APPROVED_BORDER); }
+    }
+
+    protected async Task DrawTriangle(double X, double Y, double DayCellWidth, string FillColor, string BorderColor)
+    {
+        // The triangle will be 10 pixels wide and 14 pixels tall
+        double XStart = (X + ((DayCellWidth - 10) / 2));
+        double YStart = (Y + ((DAY_QUARTER_HEIGHT - 14) / 2));
+
+        // Set the line and fill colors
+        await _context.SetFillStyleAsync(FillColor);
+        await _context.SetStrokeStyleAsync(BorderColor);
+
+        // Plot the triangle's outline
+        await _context.BeginPathAsync(); // Clears previous lines that were drawn
+        await _context.MoveToAsync(XStart, YStart);
+        await _context.LineToAsync((XStart + 3), YStart);
+        await _context.LineToAsync((XStart + 9), (YStart + 6));
+        await _context.LineToAsync((XStart + 9), (YStart + 7));
+        await _context.LineToAsync((XStart + 3), (YStart + 13));
+        await _context.LineToAsync(XStart, (YStart + 13));
+        await _context.LineToAsync(XStart, YStart);
+
+        await _context.FillAsync(); // Fill the triangle
+        await _context.StrokeAsync(); // Draw the line around the triangle
+    }
+
+    protected async Task DrawLegend(double X, double Y)
+    {
+        // Triangles are 10 pixels wide x 14 pixels tall
+        double TextY = (Y + _TextHeightArial11);
+
+        // Unsubmitted
+        await DrawTriangle(X, Y, 10, STATUS_COLOR_UNSUBMITTED_FILL, STATUS_COLOR_UNSUBMITTED_BORDER);
+        double TextWidth = await DrawTextAsync((X + 12), TextY, "Unsubmitted", FONTINFO_ARIAL_11, Baseline: TextBaseline.Middle);
+
+        // Rejected
+        X += (12 + TextWidth + 8);
+        await DrawTriangle(X, Y, 10, STATUS_COLOR_REJECTED_FILL, STATUS_COLOR_REJECTED_BORDER);
+        TextWidth = await DrawTextAsync((X + 12), TextY, "Rejected", FONTINFO_ARIAL_11, Baseline: TextBaseline.Middle);
+
+        // Under Review
+        X += (12 + TextWidth + 8);
+        await DrawTriangle(X, Y, 10, STATUS_COLOR_UNDER_REVIEW_FILL, STATUS_COLOR_UNDER_REVIEW_BORDER);
+        TextWidth = await DrawTextAsync((X + 12), TextY, "Under Review", FONTINFO_ARIAL_11, Baseline: TextBaseline.Middle);
+
+        // Approved
+        X += (12 + TextWidth + 8);
+        await DrawTriangle(X, Y, 10, STATUS_COLOR_APPROVED_FILL, STATUS_COLOR_APPROVED_BORDER);
+        await DrawTextAsync((X + 12), TextY, "Approved", FONTINFO_ARIAL_11, Baseline: TextBaseline.Middle);
+    }
+
+    // This panel doubles as a processing indicator and this function handles the work of displaying the 'Processing...' text
+    protected async Task DrawProcessingAsync(double Width, double Height)
+    {
+        // If we're to indicate processing then...
+        if (_IndicateProcessing)
+        {
+            // Draw an opaque background over the timeline
+            await _context.SetFillStyleAsync(PROCESSING_TEXT_BACKGROUND_COLOR);
+            await _context.FillRectAsync(0, 0, Width, Height);
+
+            // Text is horizontally centered in the space given
+            await DrawTextAsync((Width / 2), ((Height - _TextHeightArial26Bold) / 2),
+                "Processing... One moment please.",
+                FONTINFO_ARIAL_26_BOLD, PROCESSING_TEXT_COLOR, TextAlign.Center, TextBaseline.Top);
+        }
+    }
+
+    protected async Task<double> DrawTextAsync(double X, double Y, string Text, string FontInfo = FONTINFO_ARIAL_9,
+        string TextColor = TEXT_COLOR, TextAlign Align = TextAlign.Left, TextBaseline Baseline = TextBaseline.Alphabetic)
+    {
+        await _context.SetFontAsync(FontInfo);
+        TextMetrics Metrics = await _context.MeasureTextAsync(Text);
+
+        await _context.SetFillStyleAsync(TextColor);
+        await _context.SetTextAlignAsync(Align);
+        await _context.SetTextBaselineAsync(Baseline);
+        await _context.FillTextAsync(Text, X, Y);
+
+        return Metrics.Width;
+    }
+}

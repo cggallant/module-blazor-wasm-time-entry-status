@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Time Entry Status</title>
+    <!-- development if running directly in a browser -->
+    <!-- <base href="/" /> -->
+    
+    <!-- production/simulator (needs to match the uri in IIS and case matters) -->
+    <base href="/modules/UserModule/" />
+
+    <link href="css/bootstrap/bootstrap.min.css" rel="stylesheet" />
+    <link href="css/app.css" rel="stylesheet" />
+    <link href="blazor-time-entry-status-module.styles.css" rel="stylesheet" />
+    <script src="_content/Blazor.Extensions.Canvas/blazor.extensions.canvas.js"></script>
+</head>
+<body>
+    <div id="app">Loading...</div>
+
+    <div id="blazor-error-ui">
+        An unhandled error has occurred.
+        <a href="" class="reload">Reload</a>
+        <a class="dismiss">🗙</a>
+    </div>
+    <script src="_framework/blazor.webassembly.js"></script>
+
+    <script>
+        // Helper function to get the URI specified by Dovico Timesheet that we can use to talk with the API (it will handle the authentication part of the call)
+        function GetTimesheetRootURI() {
+            if (window.frameElement === null) { return ""; }
+            return window.frameElement.getAttribute("data-APIRequestURI");
+        }
+    </script>
+</body>
+</html>
